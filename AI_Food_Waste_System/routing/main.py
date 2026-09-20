@@ -8,10 +8,12 @@ This FastAPI service implements a "publish-and-claim" marketplace model:
   3. The delivery partner posts webhook status updates → we relay them.
 
 SANDBOX BEHAVIOUR:
-  • No real mapping API is called.  Driving times are simulated with
-    random values (15–90 min) so development and demos work for free.
+  • The /broadcast endpoint keeps the original sandbox behaviour and
+    simulates driving times with random values (15–90 min).
+  • The /distances endpoint uses the public OSRM routing service to
+    calculate road distance and estimated driving time between coordinates.
   • No real delivery API is called.  Quotes, delivery IDs, costs, and
-    ETAs are generated with uuid / random so there is zero external dependency.
+    ETAs are still generated with uuid / random for sandbox development.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import random
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+import httpx
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -91,6 +94,40 @@ class BroadcastResponse(BaseModel):
     total_ngos_checked: int
     message: str
 
+class LocationPoint(BaseModel):
+    """A receiver destination used for routing."""
+
+    id: str
+    name: str
+    lat: float = Field(..., ge=-90, le=90)
+    lng: float = Field(..., ge=-180, le=180)
+
+
+class DistanceRequest(BaseModel):
+    """Provider location and receiver destinations."""
+
+    origin_lat: float = Field(..., ge=-90, le=90)
+    origin_lng: float = Field(..., ge=-180, le=180)
+    destinations: list[LocationPoint]
+
+
+class DistanceResult(BaseModel):
+    """Road distance and travel time for one destination."""
+
+    id: str
+    name: str
+    lat: float
+    lng: float
+    distance_km: Optional[float] = None
+    duration_mins: Optional[int] = None
+
+
+class DistanceResponse(BaseModel):
+    """Routing results returned to FoodLoop."""
+
+    origin_lat: float
+    origin_lng: float
+    results: list[DistanceResult]
 
 class DeliveryRequest(BaseModel):
     """Payload sent by an NGO (via the frontend) to book a delivery."""
@@ -241,7 +278,161 @@ async def broadcast_surplus(listing: SurplusListing):
 
 
 # ---------------------------------------------------------------------------
-# Endpoint 2 — Book a mock third-party delivery
+# Endpoint 2 — Road distance and travel-time calculation
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/logistics/distances",
+    response_model=DistanceResponse,
+    summary="Calculate road distance and travel time to receiver locations",
+    tags=["Logistics"],
+)
+async def calculate_distances(req: DistanceRequest):
+    """Calculate road distance and estimated driving time from one origin.
+
+    The origin is normally the food provider's current location. Each
+    destination represents a receiver/NGO location.
+
+    OSRM expects coordinates in longitude,latitude order. Results are sorted
+    from nearest to farthest by road distance.
+    """
+
+    if not req.destinations:
+        return DistanceResponse(
+            origin_lat=req.origin_lat,
+            origin_lng=req.origin_lng,
+            results=[],
+        )
+
+    # OSRM coordinate order is longitude,latitude.
+    coordinates = [
+        f"{req.origin_lng},{req.origin_lat}"
+    ]
+
+    for destination in req.destinations:
+        coordinates.append(
+            f"{destination.lng},{destination.lat}"
+        )
+
+    coordinate_string = ";".join(coordinates)
+
+    # First coordinate is the source; all remaining coordinates are destinations.
+    destination_indexes = ";".join(
+        str(index)
+        for index in range(1, len(coordinates))
+    )
+
+    url = (
+        "https://router.project-osrm.org/"
+        f"table/v1/driving/{coordinate_string}"
+    )
+
+    params = {
+        "sources": "0",
+        "destinations": destination_indexes,
+        "annotations": "distance,duration",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                url,
+                params=params,
+                headers={
+                    "User-Agent": "FoodLoopAI/1.0"
+                },
+            )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if data.get("code") != "Ok":
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    "Routing service could not calculate "
+                    "the requested routes."
+                ),
+            )
+
+        distances = data.get("distances", [[]])[0]
+        durations = data.get("durations", [[]])[0]
+
+        if len(distances) != len(req.destinations) or len(durations) != len(req.destinations):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Routing service returned an incomplete route matrix.",
+            )
+
+        results: list[DistanceResult] = []
+
+        for index, destination in enumerate(req.destinations):
+            distance_meters = (
+                distances[index]
+                if index < len(distances)
+                else None
+            )
+
+            duration_seconds = (
+                durations[index]
+                if index < len(durations)
+                else None
+            )
+
+            results.append(
+                DistanceResult(
+                    id=destination.id,
+                    name=destination.name,
+                    lat=destination.lat,
+                    lng=destination.lng,
+                    distance_km=(
+                        round(distance_meters / 1000, 2)
+                        if distance_meters is not None
+                        else None
+                    ),
+                    duration_mins=(
+                        round(duration_seconds / 60)
+                        if duration_seconds is not None
+                        else None
+                    ),
+                )
+            )
+
+        # Nearest receiver first.
+        results.sort(
+            key=lambda item: (
+                item.distance_km
+                if item.distance_km is not None
+                else float("inf")
+            )
+        )
+
+        return DistanceResponse(
+            origin_lat=req.origin_lat,
+            origin_lng=req.origin_lng,
+            results=results,
+        )
+
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                "Routing service returned an HTTP error: "
+                f"{exc.response.status_code}"
+            ),
+        ) from exc
+
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Routing service unavailable: {exc}",
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Endpoint 3 — Book a mock third-party delivery
 # ---------------------------------------------------------------------------
 
 
@@ -297,7 +488,7 @@ async def book_delivery(req: DeliveryRequest):
 
 
 # ---------------------------------------------------------------------------
-# Endpoint 3 — Delivery webhook listener (live tracking)
+# Endpoint 4 — Delivery webhook listener (live tracking)
 # ---------------------------------------------------------------------------
 
 
