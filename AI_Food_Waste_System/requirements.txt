@@ -1,7 +1,8 @@
 streamlit
-pandas
-scikit-learn
-joblib
 firebase-admin>=6.5.0
 streamlit-geolocation
 requests
+pandas==2.3.3
+numpy==2.2.6
+scikit-learn==1.6.1
+joblib==1.6.0
