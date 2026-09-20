@@ -1,0 +1,5 @@
+streamlit
+pandas
+scikit-learn
+joblib
+firebase-admin>=6.5.0
