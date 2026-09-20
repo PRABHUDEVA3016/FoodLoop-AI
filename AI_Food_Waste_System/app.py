@@ -4,7 +4,15 @@ from datetime import datetime, timezone
 
 import joblib
 import pandas as pd
+import requests as http_requests
 import streamlit as st
+
+try:
+    from streamlit_geolocation import streamlit_geolocation
+    GEOLOCATION_AVAILABLE = True
+except ImportError:
+    streamlit_geolocation = None
+    GEOLOCATION_AVAILABLE = False
 
 try:
     import firebase_admin
@@ -299,7 +307,10 @@ if "user_id" not in st.session_state:
 if "provider_profile" not in st.session_state:
     st.session_state.provider_profile = {
         "organization_name": "Food Provider",
-        "location": ""
+        "location": "",
+        "latitude": None,
+        "longitude": None,
+        "location_accuracy": None
     }
 
 # Receiver-side state
@@ -308,7 +319,10 @@ if "receiver_profile" not in st.session_state:
         "organization_name": "",
         "people_required": 0,
         "preferred_food": "Any",
-        "required_quantity_kg": 0.0
+        "required_quantity_kg": 0.0,
+        "latitude": None,
+        "longitude": None,
+        "location_accuracy": None
     }
 
 if "receiver_requests" not in st.session_state:
@@ -420,6 +434,269 @@ def firebase_delete(path):
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def get_routing_service_url():
+    """
+    Return the base URL of the FoodLoop routing microservice.
+
+    Local development:
+        http://127.0.0.1:8000
+
+    Production:
+        Set FOODLOOP_ROUTING_URL or [routing].base_url in Streamlit secrets.
+    """
+    env_url = os.getenv("FOODLOOP_ROUTING_URL")
+    if env_url:
+        return env_url.rstrip("/")
+
+    try:
+        routing_config = st.secrets.get("routing", {})
+        secret_url = routing_config.get("base_url")
+        if secret_url:
+            return str(secret_url).rstrip("/")
+    except Exception:
+        pass
+
+    return "http://127.0.0.1:8000"
+
+
+def get_current_browser_location():
+    """
+    Read the current browser/device location through the browser
+    Geolocation API.
+
+    Returns:
+        dict with latitude, longitude and accuracy, or None.
+    """
+    if not GEOLOCATION_AVAILABLE:
+        return None
+
+    try:
+        location = streamlit_geolocation()
+    except Exception:
+        return None
+
+    if not location:
+        return None
+
+    latitude = location.get("latitude")
+    longitude = location.get("longitude")
+    accuracy = location.get("accuracy")
+
+    if latitude is None or longitude is None:
+        return None
+
+    try:
+        latitude = float(latitude)
+        longitude = float(longitude)
+    except (TypeError, ValueError):
+        return None
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "accuracy": (
+            float(accuracy)
+            if accuracy is not None
+            else None
+        )
+    }
+
+
+def save_current_location(role, location):
+    """
+    Save a detected location into session state and Firebase.
+
+    The location is only written to Firebase when the coordinates
+    actually change, avoiding unnecessary writes on Streamlit reruns.
+    """
+    if not location:
+        return
+
+    if role == "provider":
+        profile_key = "provider_profile"
+        firebase_role = "provider"
+    else:
+        profile_key = "receiver_profile"
+        firebase_role = "receiver"
+
+    profile = st.session_state[profile_key]
+
+    latitude = float(location["latitude"])
+    longitude = float(location["longitude"])
+    accuracy = location.get("accuracy")
+
+    previous_coords = (
+        profile.get("latitude"),
+        profile.get("longitude")
+    )
+    new_coords = (latitude, longitude)
+
+    profile["latitude"] = latitude
+    profile["longitude"] = longitude
+    profile["location_accuracy"] = accuracy
+
+    saved_key = f"{role}_saved_location"
+    if st.session_state.get(saved_key) == new_coords:
+        return
+
+    if firebase_ready()[0]:
+        firebase_update(
+            f"foodloop/users/{st.session_state.user_id}",
+            {
+                "role": firebase_role,
+                "latitude": latitude,
+                "longitude": longitude,
+                "location_accuracy": accuracy,
+                "updated_at": now_iso()
+            }
+        )
+
+    st.session_state[saved_key] = new_coords
+
+
+def request_location_block(role):
+    """
+    Render the browser-location control and persist a newly detected
+    provider/receiver location.
+    """
+    if not GEOLOCATION_AVAILABLE:
+        st.error(
+            "Browser location support is not installed. "
+            "Run: pip install streamlit-geolocation"
+        )
+        return None
+
+    location = get_current_browser_location()
+
+    if location:
+        save_current_location(role, location)
+
+        st.success("Current location detected and saved.")
+
+        accuracy = location.get("accuracy")
+        if accuracy is not None:
+            st.caption(
+                f"Latitude: {location['latitude']:.6f} | "
+                f"Longitude: {location['longitude']:.6f} | "
+                f"Accuracy: ±{accuracy:.1f} m"
+            )
+        else:
+            st.caption(
+                f"Latitude: {location['latitude']:.6f} | "
+                f"Longitude: {location['longitude']:.6f}"
+            )
+
+    else:
+        profile = st.session_state[
+            "provider_profile" if role == "provider"
+            else "receiver_profile"
+        ]
+
+        if profile.get("latitude") is not None and profile.get("longitude") is not None:
+            st.info(
+                "A previously saved location is being used. "
+                "Use the location control above to update it."
+            )
+            st.caption(
+                f"Saved coordinates: "
+                f"{float(profile['latitude']):.6f}, "
+                f"{float(profile['longitude']):.6f}"
+            )
+        else:
+            st.warning(
+                "Location not detected yet. Allow browser location "
+                "permission and use the location control above."
+            )
+
+    return location
+
+
+def calculate_provider_routes(provider_lat, provider_lng, receiver_requests):
+    """
+    Send the provider's current coordinates and receiver coordinates
+    to the FoodLoop FastAPI routing service.
+
+    Returns:
+        (route_map, error_message)
+        route_map is keyed by request ID.
+    """
+    if provider_lat is None or provider_lng is None:
+        return {}, "Provider current location is not available."
+
+    destinations = []
+
+    for request in receiver_requests:
+        receiver_lat = request.get("receiver_latitude")
+        receiver_lng = request.get("receiver_longitude")
+
+        if receiver_lat is None or receiver_lng is None:
+            continue
+
+        try:
+            destinations.append(
+                {
+                    "id": str(request["id"]),
+                    "name": str(
+                        request.get("receiver_name", "Receiver")
+                    ),
+                    "lat": float(receiver_lat),
+                    "lng": float(receiver_lng)
+                }
+            )
+        except (TypeError, ValueError, KeyError):
+            continue
+
+    if not destinations:
+        return {}, (
+            "No pending receiver request currently contains valid "
+            "receiver coordinates."
+        )
+
+    payload = {
+        "origin_lat": float(provider_lat),
+        "origin_lng": float(provider_lng),
+        "destinations": destinations
+    }
+
+    url = (
+        f"{get_routing_service_url()}"
+        "/api/logistics/distances"
+    )
+
+    try:
+        response = http_requests.post(
+            url,
+            json=payload,
+            timeout=20
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        results = data.get("results", [])
+
+        route_map = {
+            str(result["id"]): result
+            for result in results
+            if isinstance(result, dict) and result.get("id") is not None
+        }
+
+        return route_map, None
+
+    except http_requests.RequestException as exc:
+        return {}, (
+            "Routing service could not be reached. "
+            f"Check that the FastAPI service is running at "
+            f"{get_routing_service_url()}. Details: {exc}"
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        return {}, f"Invalid routing-service response: {exc}"
+
+
+def get_route_for_request(route_map, request_id):
+    """Return the routing result for one request."""
+    return route_map.get(str(request_id), {})
 
 
 def create_notification(user_id, title, message, notification_type="info"):
@@ -1615,7 +1892,7 @@ elif st.session_state.user_role == "provider" and page == "Food Requests":
 
     show_page_header(
         "Food Requests",
-        "View live requests raised by food receivers and approve suitable requests."
+        "View pending receiver requests and compare road distance from your current location."
     )
 
     render_live_refresh_hint()
@@ -1627,16 +1904,46 @@ elif st.session_state.user_role == "provider" and page == "Food Requests":
         render_firebase_setup_warning(firebase_error)
 
     else:
+        # --------------------------------------------------------
+        # PROVIDER CURRENT LOCATION
+        # --------------------------------------------------------
+
+        st.markdown(
+            '<div class="section-title">Provider Current Location</div>',
+            unsafe_allow_html=True
+        )
+
+        st.markdown(
+            '<div class="section-description">'
+            'Your current browser location is used as the routing origin. '
+            'Road distance and ETA are calculated to each receiver location.'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        request_location_block("provider")
+
+        provider_profile = st.session_state.provider_profile
+        provider_lat = provider_profile.get("latitude")
+        provider_lng = provider_profile.get("longitude")
+
+        if provider_lat is not None and provider_lng is not None:
+            st.success(
+                "Routing origin is ready. Pending requests with receiver "
+                "coordinates will be sorted nearest-first."
+            )
+
+        st.divider()
 
         def render_provider_requests():
             try:
-                requests = get_food_requests()
+                requests_data = get_food_requests()
                 listings = get_food_listings()
 
                 provider_id = st.session_state.user_id
 
                 relevant_requests = [
-                    request for request in requests
+                    request for request in requests_data
                     if request.get("status") == "pending"
                     and provider_matches_request(request, provider_id)
                 ]
@@ -1651,6 +1958,50 @@ elif st.session_state.user_role == "provider" and page == "Food Requests":
                         "No pending food requests right now."
                     )
                     return
+
+                # ------------------------------------------------
+                # ROAD ROUTING
+                # ------------------------------------------------
+
+                route_map, route_error = calculate_provider_routes(
+                    provider_lat,
+                    provider_lng,
+                    relevant_requests
+                )
+
+                # The routing service already sorts by road distance.
+                # We apply the returned distance to the corresponding
+                # request and sort again here so the UI remains
+                # nearest-first even if the service response order changes.
+                def request_sort_key(request):
+                    route = get_route_for_request(
+                        route_map,
+                        request["id"]
+                    )
+
+                    distance = route.get("distance_km")
+
+                    if distance is None:
+                        return (1, float("inf"))
+
+                    try:
+                        return (0, float(distance))
+                    except (TypeError, ValueError):
+                        return (1, float("inf"))
+
+                relevant_requests.sort(key=request_sort_key)
+
+                if route_map:
+                    st.success(
+                        "Requests are sorted by road distance from your "
+                        "current location."
+                    )
+                elif route_error:
+                    st.warning(route_error)
+
+                # ------------------------------------------------
+                # REQUEST CARDS
+                # ------------------------------------------------
 
                 for request in relevant_requests:
 
@@ -1671,6 +2022,11 @@ elif st.session_state.user_role == "provider" and page == "Food Requests":
                             and listing.get("provider_id") == provider_id
                             and listing.get("status") == "available"
                         ]
+
+                    route = get_route_for_request(
+                        route_map,
+                        request["id"]
+                    )
 
                     with st.container(border=True):
 
@@ -1697,6 +2053,31 @@ elif st.session_state.user_role == "provider" and page == "Food Requests":
                                 f"{int(request.get('people_to_serve', 0))}"
                             )
 
+                            # Routing result
+                            if route:
+                                distance_km = route.get("distance_km")
+                                duration_mins = route.get("duration_mins")
+
+                                if distance_km is not None:
+                                    st.metric(
+                                        "Road Distance",
+                                        f"{float(distance_km):.2f} km"
+                                    )
+
+                                if duration_mins is not None:
+                                    st.caption(
+                                        f"Estimated driving time: "
+                                        f"{int(duration_mins)} min"
+                                    )
+                            elif (
+                                request.get("receiver_latitude") is None
+                                or request.get("receiver_longitude") is None
+                            ):
+                                st.caption(
+                                    "Receiver location not available; "
+                                    "distance cannot be calculated."
+                                )
+
                             st.caption(
                                 f"Request ID: {request['id']}"
                             )
@@ -1704,6 +2085,12 @@ elif st.session_state.user_role == "provider" and page == "Food Requests":
                             if request.get("requirement"):
                                 st.write(
                                     f"**Requirement:** {request['requirement']}"
+                                )
+
+                            if request.get("pickup_preference"):
+                                st.write(
+                                    f"**Pickup preference:** "
+                                    f"{request['pickup_preference']}"
                                 )
 
                         with request_col2:
@@ -1892,7 +2279,7 @@ elif st.session_state.user_role == "provider" and page == "Food Requests":
                 st.error(f"Could not load food requests: {e}")
 
         if hasattr(st, "fragment"):
-            live_requests = st.fragment(run_every="5s")(
+            live_requests = st.fragment(run_every="30s")(
                 render_provider_requests
             )
             live_requests()
@@ -1900,7 +2287,6 @@ elif st.session_state.user_role == "provider" and page == "Food Requests":
             render_provider_requests()
 
 
-# ============================================================
 # PAGE 5 — MY DONATIONS
 # ============================================================
 
@@ -2040,7 +2426,15 @@ elif st.session_state.user_role == "provider" and page == "My Donations":
                         "organization_name":
                             provider_name.strip(),
                         "location":
-                            pickup_location.strip()
+                            pickup_location.strip(),
+                        "latitude":
+                            st.session_state.provider_profile.get("latitude"),
+                        "longitude":
+                            st.session_state.provider_profile.get("longitude"),
+                        "location_accuracy":
+                            st.session_state.provider_profile.get(
+                                "location_accuracy"
+                            )
                     }
 
                     firebase_update(
@@ -2051,6 +2445,18 @@ elif st.session_state.user_role == "provider" and page == "My Donations":
                                 provider_name.strip(),
                             "location":
                                 pickup_location.strip(),
+                            "latitude":
+                                st.session_state.provider_profile.get(
+                                    "latitude"
+                                ),
+                            "longitude":
+                                st.session_state.provider_profile.get(
+                                    "longitude"
+                                ),
+                            "location_accuracy":
+                                st.session_state.provider_profile.get(
+                                    "location_accuracy"
+                                ),
                             "updated_at": now_iso()
                         }
                     )
@@ -2067,6 +2473,18 @@ elif st.session_state.user_role == "provider" and page == "My Donations":
                                 pickup_window.strip(),
                             "pickup_location":
                                 pickup_location.strip(),
+                            "provider_latitude":
+                                st.session_state.provider_profile.get(
+                                    "latitude"
+                                ),
+                            "provider_longitude":
+                                st.session_state.provider_profile.get(
+                                    "longitude"
+                                ),
+                            "provider_location_accuracy":
+                                st.session_state.provider_profile.get(
+                                    "location_accuracy"
+                                ),
                             "notes":
                                 donation_notes.strip(),
                             "quality_status":
@@ -2341,6 +2759,22 @@ elif st.session_state.user_role == "receiver":
 
                 profile = st.session_state.receiver_profile
 
+                # ------------------------------------------------
+                # RECEIVER CURRENT LOCATION
+                # ------------------------------------------------
+
+                st.markdown(
+                    '<div class="section-description">'
+                    'Your current location is attached to food requests so '
+                    'providers can calculate road distance and ETA.'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
+
+                request_location_block("receiver")
+
+                profile = st.session_state.receiver_profile
+
                 with st.form("receiver_requirement_form"):
 
                     col1, col2 = st.columns(2)
@@ -2403,7 +2837,13 @@ elif st.session_state.user_role == "receiver":
                             "preferred_food":
                                 preferred_food,
                             "required_quantity_kg":
-                                required_quantity_kg
+                                required_quantity_kg,
+                            "latitude":
+                                profile.get("latitude"),
+                            "longitude":
+                                profile.get("longitude"),
+                            "location_accuracy":
+                                profile.get("location_accuracy")
                         }
 
                         firebase_update(
@@ -2418,6 +2858,12 @@ elif st.session_state.user_role == "receiver":
                                     preferred_food,
                                 "required_quantity_kg":
                                     required_quantity_kg,
+                                "latitude":
+                                    profile.get("latitude"),
+                                "longitude":
+                                    profile.get("longitude"),
+                                "location_accuracy":
+                                    profile.get("location_accuracy"),
                                 "updated_at": now_iso()
                             }
                         )
@@ -2620,6 +3066,21 @@ elif st.session_state.user_role == "receiver":
                                             "its own listing."
                                         )
 
+                                    elif (
+                                        st.session_state.receiver_profile.get(
+                                            "latitude"
+                                        ) is None
+                                        or st.session_state.receiver_profile.get(
+                                            "longitude"
+                                        ) is None
+                                    ):
+
+                                        st.warning(
+                                            "Update your current location "
+                                            "in Receiver Dashboard before "
+                                            "submitting a routed request."
+                                        )
+
                                     else:
 
                                         existing_requests = get_food_requests()
@@ -2666,6 +3127,18 @@ elif st.session_state.user_role == "receiver":
                                                         listing.get("provider_id"),
                                                     "provider_name":
                                                         listing.get("provider_name"),
+                                                    "receiver_latitude":
+                                                        st.session_state.receiver_profile.get(
+                                                            "latitude"
+                                                        ),
+                                                    "receiver_longitude":
+                                                        st.session_state.receiver_profile.get(
+                                                            "longitude"
+                                                        ),
+                                                    "receiver_location_accuracy":
+                                                        st.session_state.receiver_profile.get(
+                                                            "location_accuracy"
+                                                        ),
                                                     "status": "pending",
                                                     "requirement":
                                                         "",
@@ -2794,6 +3267,15 @@ elif st.session_state.user_role == "receiver":
                         "Requested quantity must be greater than zero."
                     )
 
+                elif (
+                    st.session_state.receiver_profile.get("latitude") is None
+                    or st.session_state.receiver_profile.get("longitude") is None
+                ):
+                    st.error(
+                        "Update your current location in Receiver Dashboard "
+                        "before submitting a routed request."
+                    )
+
                 else:
 
                     st.session_state.receiver_profile[
@@ -2819,6 +3301,18 @@ elif st.session_state.user_role == "receiver":
                                 None,
                             "provider_name":
                                 None,
+                            "receiver_latitude":
+                                st.session_state.receiver_profile.get(
+                                    "latitude"
+                                ),
+                            "receiver_longitude":
+                                st.session_state.receiver_profile.get(
+                                    "longitude"
+                                ),
+                            "receiver_location_accuracy":
+                                st.session_state.receiver_profile.get(
+                                    "location_accuracy"
+                                ),
                             "status":
                                 "pending",
                             "requirement":
@@ -3106,11 +3600,12 @@ elif st.session_state.user_role == "receiver":
         )
 
         st.write(
-            "1. Save your organization profile.\n\n"
+            "1. Save your organization profile and update your current location.\n\n"
             "2. Check Live Food for available donations.\n\n"
             "3. Request a suitable food donation, or create a new request.\n\n"
             "4. Wait for the provider to approve or reject the request.\n\n"
-            "5. Track the decision from My Requests."
+            "5. Providers can compare road distance and ETA from their current location.\n\n"
+            "6. Track the decision from My Requests."
         )
 
         st.caption(
